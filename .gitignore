@@ -1,0 +1,38 @@
+# ---- 环境与密钥 ----
+.env
+*.key
+*.pem
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+venv_windows/
+
+# ---- Node ----
+node_modules/
+dist/
+*.local
+
+# ---- 数据（生成的商品/向量库/日志）不入库 ----
+data/raw/*
+data/processed/*
+data/chroma/
+backend/data/
+logs/
+*.log
+
+# ---- 编辑器/系统 ----
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ---- 模型权重（太大不入库）----
+*.safetensors
+*.bin
+
+# 商家上传的商品主图（运行时产生）
+backend/app/static/uploads/

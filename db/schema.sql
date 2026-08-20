@@ -13,6 +13,10 @@ CREATE TABLE IF NOT EXISTS users (
     nickname      VARCHAR(50)   NOT NULL DEFAULT '' COMMENT '昵称',
     role          VARCHAR(20)   NOT NULL DEFAULT 'buyer' COMMENT '角色: buyer/merchant',
     shop_name     VARCHAR(100)  NOT NULL DEFAULT '' COMMENT '店铺名(role=merchant 时有效)',
+    warehouse_name    VARCHAR(100)  NOT NULL DEFAULT '' COMMENT '仓库名(商家发货点)',
+    warehouse_address VARCHAR(255)  NOT NULL DEFAULT '' COMMENT '仓库地址',
+    warehouse_lng     DECIMAL(10,6) NULL COMMENT '仓库经度',
+    warehouse_lat     DECIMAL(10,6) NULL COMMENT '仓库纬度',
     created_at    DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uk_username (username),
     KEY idx_role (role)
@@ -139,14 +143,85 @@ CREATE TABLE IF NOT EXISTS orders (
     id            BIGINT AUTO_INCREMENT PRIMARY KEY,
     order_no      VARCHAR(32)   NOT NULL COMMENT '订单号',
     user_id       BIGINT        NOT NULL COMMENT '所属用户',
+    merchant_id   BIGINT        NULL     COMMENT '所属商家(按商家拆单)',
+    shop_name     VARCHAR(100)  NOT NULL DEFAULT '' COMMENT '店铺名快照',
     session_key   VARCHAR(64)   NOT NULL DEFAULT '' COMMENT '来源会话(可选)',
     products      JSON          NOT NULL COMMENT '商品快照 [{id,title,price,quantity}]',
     total_amount  DECIMAL(10,2) NOT NULL COMMENT '总金额',
-    status        VARCHAR(20)   NOT NULL DEFAULT 'pending' COMMENT 'pending/paid/shipped/done',
+    status        VARCHAR(20)   NOT NULL DEFAULT 'pending'
+                  COMMENT 'pending待商家确认/confirmed已接单/shipping配送中/delivered已送达/cancelled已取消',
+    -- ===== 收货信息(下单时从 addresses 快照) =====
+    address_id    BIGINT        NULL     COMMENT '收货地址ID',
+    receiver      VARCHAR(50)   NOT NULL DEFAULT '' COMMENT '收货人',
+    phone         VARCHAR(20)   NOT NULL DEFAULT '' COMMENT '联系电话',
+    address_text  VARCHAR(255)  NOT NULL DEFAULT '' COMMENT '完整收货地址',
+    dest_lng      DECIMAL(10,6) NULL     COMMENT '收货点经度',
+    dest_lat      DECIMAL(10,6) NULL     COMMENT '收货点纬度',
+    origin_lng    DECIMAL(10,6) NULL     COMMENT '发货点经度',
+    origin_lat    DECIMAL(10,6) NULL     COMMENT '发货点纬度',
+    origin_name   VARCHAR(100)  NOT NULL DEFAULT '' COMMENT '发货点名称(商家仓库或同城前置仓)',
+    warehouse_id  BIGINT        NULL     COMMENT '商家接单时选择的发货仓',
+    -- ===== 配送轨迹 =====
+    route         JSON          NULL     COMMENT '高德路径规划得到的道路点 [[lng,lat],...]',
+    eta_minutes   INT           NOT NULL DEFAULT 30 COMMENT '预计配送总时长(分钟)',
+    rider_name    VARCHAR(50)   NOT NULL DEFAULT '' COMMENT '骑手姓名',
+    rider_phone   VARCHAR(20)   NOT NULL DEFAULT '' COMMENT '骑手电话',
+    confirmed_at  DATETIME      NULL     COMMENT '商家接单时间',
+    shipped_at    DATETIME      NULL     COMMENT '发货时间(配送进度按此计算)',
+    delivered_at  DATETIME      NULL     COMMENT '送达时间',
+    -- ===== 售后 =====
+    aftersale_status VARCHAR(20) NOT NULL DEFAULT 'none'
+                     COMMENT 'none/pending待处理/approved已同意/rejected已拒绝',
+    aftersale_type   VARCHAR(20) NOT NULL DEFAULT '' COMMENT 'refund退款/return退货/exchange换货/repair维修',
+    aftersale_reason VARCHAR(255) NOT NULL DEFAULT '' COMMENT '售后原因',
+    aftersale_reply  VARCHAR(255) NOT NULL DEFAULT '' COMMENT '商家处理说明',
+    aftersale_at     DATETIME    NULL COMMENT '申请时间',
     created_at    DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uk_order_no (order_no),
-    KEY idx_user (user_id)
+    KEY idx_user (user_id),
+    KEY idx_merchant_status (merchant_id, status)
 ) ENGINE=InnoDB COMMENT='订单';
+
+-- 收货地址表(用户长期登记，下单时快照到订单)
+CREATE TABLE IF NOT EXISTS addresses (    id            BIGINT AUTO_INCREMENT PRIMARY KEY,
+    user_id       BIGINT        NOT NULL COMMENT '所属用户',
+    receiver      VARCHAR(50)   NOT NULL COMMENT '收货人',
+    phone         VARCHAR(20)   NOT NULL COMMENT '联系电话',
+    province      VARCHAR(50)   NOT NULL DEFAULT '' COMMENT '省',
+    city          VARCHAR(50)   NOT NULL DEFAULT '' COMMENT '市',
+    district      VARCHAR(50)   NOT NULL DEFAULT '' COMMENT '区/县',
+    detail        VARCHAR(255)  NOT NULL COMMENT '详细地址',
+    lng           DECIMAL(10,6) NULL     COMMENT '经度(高德地理编码)',
+    lat           DECIMAL(10,6) NULL     COMMENT '纬度(高德地理编码)',
+    is_default    TINYINT       NOT NULL DEFAULT 0 COMMENT '是否默认地址',
+    created_at    DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at    DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    KEY idx_user (user_id)
+) ENGINE=InnoDB COMMENT='收货地址';
+
+-- 商家仓库(一个商家可有多个发货仓)
+CREATE TABLE IF NOT EXISTS warehouses (
+    id            BIGINT AUTO_INCREMENT PRIMARY KEY,
+    merchant_id   BIGINT        NOT NULL COMMENT '所属商家 users.id',
+    name          VARCHAR(100)  NOT NULL COMMENT '仓库名',
+    address       VARCHAR(255)  NOT NULL DEFAULT '' COMMENT '仓库地址',
+    lng           DECIMAL(10,6) NULL     COMMENT '经度',
+    lat           DECIMAL(10,6) NULL     COMMENT '纬度',
+    is_default    TINYINT       NOT NULL DEFAULT 0 COMMENT '是否主仓',
+    created_at    DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    KEY idx_merchant (merchant_id)
+) ENGINE=InnoDB COMMENT='商家仓库';
+
+-- 分仓库存(商家接单选仓时校验并扣减)
+CREATE TABLE IF NOT EXISTS warehouse_stock (
+    id            BIGINT AUTO_INCREMENT PRIMARY KEY,
+    warehouse_id  BIGINT        NOT NULL,
+    product_id    BIGINT        NOT NULL,
+    quantity      INT           NOT NULL DEFAULT 0 COMMENT '剩余库存',
+    updated_at    DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uk_wh_product (warehouse_id, product_id),
+    KEY idx_product (product_id)
+) ENGINE=InnoDB COMMENT='分仓库存';
 
 -- 用户画像缓存表(对话槽位→标签/雷达图，供跨会话记忆)
 CREATE TABLE IF NOT EXISTS profiles (    id            BIGINT AUTO_INCREMENT PRIMARY KEY,

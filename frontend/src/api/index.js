@@ -107,6 +107,24 @@ export function merchantRemoveImage(id) { return http.delete(`/merchant/products
 export function merchantDashboard(days = 30) {
   return http.get('/merchant/dashboard', { params: { days } })
 }
+export function merchantListOrders(status = '') {
+  return http.get('/merchant/orders', { params: { status } })
+}
+export function merchantPendingCount() { return http.get('/merchant/orders/pending-count') }
+export function merchantOrderWarehouses(orderNo) {
+  return http.get(`/merchant/orders/${orderNo}/warehouses`)
+}
+export function merchantAcceptOrder(orderNo, warehouseId) {
+  return http.post(`/merchant/orders/${orderNo}/accept`, { warehouse_id: warehouseId ?? null })
+}
+export function merchantRejectOrder(orderNo) { return http.post(`/merchant/orders/${orderNo}/reject`) }
+export function merchantListAftersale() { return http.get('/merchant/aftersale') }
+export function merchantHandleAftersale(orderNo, approve, reply = '') {
+  return http.post(`/merchant/orders/${orderNo}/aftersale`, { approve, reply })
+}
+export function merchantAssistant(message) {
+  return http.post('/merchant/assistant', { message })
+}
 
 // ---- 购物车 / 订单 / 画像（需登录） ----
 export function addToCart(productId) {
@@ -114,9 +132,25 @@ export function addToCart(productId) {
 }
 export function getCart() { return http.get('/cart') }
 export function removeCartItem(itemId) { return http.delete(`/cart/${itemId}`) }
-export function createOrder() { return http.post('/order') }
+export function createOrder(addressId) {
+  return http.post('/order', { address_id: addressId ?? null, session_id: getSessionId() })
+}
 export function getOrders() { return http.get('/order') }
+export function getOrder(orderNo) { return http.get(`/order/${orderNo}`) }
+export function saveOrderRoute(orderNo, route) {
+  return http.post(`/order/${orderNo}/route`, { route })
+}
+export function applyAftersale(orderNo, type, reason) {
+  return http.post(`/order/${orderNo}/aftersale`, { type, reason })
+}
 export function getProfile() { return http.get('/profile') }
+
+// ---- 收货地址 ----
+export function listAddresses() { return http.get('/addresses') }
+export function createAddress(payload) { return http.post('/addresses', payload) }
+export function updateAddress(id, payload) { return http.put(`/addresses/${id}`, payload) }
+export function setDefaultAddress(id) { return http.post(`/addresses/${id}/default`) }
+export function deleteAddress(id) { return http.delete(`/addresses/${id}`) }
 
 // ---- 收藏（需登录） ----
 export function addFavorite(productId) { return http.post('/favorites/add', { product_id: productId }) }

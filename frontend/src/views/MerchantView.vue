@@ -5,7 +5,19 @@
         <h2>商家中心</h2>
         <p class="sub">{{ user?.shop_name || user?.nickname }} · 管理商品与营销位</p>
       </div>
-      <el-button type="primary" @click="openCreate">＋ 新建商品</el-button>
+      <div class="head-ops">
+        <!-- 订单接收入口：有新订单/待售后时冒角标 -->
+        <div class="bell" @click="goOrders">
+          <svg viewBox="0 0 24 24" width="20" height="20">
+            <path fill="currentColor" d="M12 22a2 2 0 002-2h-4a2 2 0 002 2zm6-6V11a6 6 0 10-12 0v5l-2 2v1h16v-1l-2-2z" />
+          </svg>
+          <span v-if="pendingCount + aftersaleCount > 0" class="bell-badge">
+            {{ pendingCount + aftersaleCount }}
+          </span>
+          <span class="bell-text">订单接收</span>
+        </div>
+        <el-button type="primary" @click="openCreate">＋ 新建商品</el-button>
+      </div>
     </div>
 
     <el-tabs v-model="tab" class="tabs">
@@ -113,6 +125,74 @@
           :total="total"
           @current-change="(p) => { page = p; load() }"
         />
+      </el-tab-pane>
+
+      <!-- ===== 订单接收 ===== -->
+      <el-tab-pane name="orders">
+        <template #label>
+          订单接收
+          <el-badge v-if="pendingCount + aftersaleCount > 0" :value="pendingCount + aftersaleCount" class="tab-badge" />
+        </template>
+
+        <div class="filters">
+          <el-radio-group v-model="orderFilter" size="small" @change="loadOrders">
+            <el-radio-button value="pending">待接单 {{ pendingCount ? `(${pendingCount})` : '' }}</el-radio-button>
+            <el-radio-button value="shipping">配送中</el-radio-button>
+            <el-radio-button value="aftersale">待售后 {{ aftersaleCount ? `(${aftersaleCount})` : '' }}</el-radio-button>
+            <el-radio-button value="">全部</el-radio-button>
+          </el-radio-group>
+          <el-button size="small" @click="loadOrders">刷新</el-button>
+        </div>
+
+        <el-empty v-if="!orders.length" description="没有符合条件的订单" :image-size="70" />
+        <div v-else class="order-grid">
+          <OrderCard
+            v-for="o in orders"
+            :key="o.order_no"
+            :order="o"
+            role="merchant"
+            :busy="orderBusy === o.order_no"
+            @accept="acceptOrder"
+            @reject="rejectOrder"
+            @aftersale="decideAftersale"
+          />
+        </div>
+      </el-tab-pane>
+
+      <!-- ===== AI 订单助手 ===== -->
+      <el-tab-pane label="订单助手" name="assistant">
+        <div class="assistant">
+          <div class="asst-body" ref="asstBodyRef">
+            <div v-for="(m, i) in asstMessages" :key="i" class="asst-row" :class="m.role">
+              <div class="asst-bubble">{{ m.content }}</div>
+              <div v-if="m.cards && m.cards.length" class="order-cards">
+                <OrderCard
+                  v-for="o in m.cards"
+                  :key="o.order_no"
+                  :order="o"
+                  role="merchant"
+                  :busy="orderBusy === o.order_no"
+                  @accept="acceptOrder"
+                  @reject="rejectOrder"
+                  @aftersale="decideAftersale"
+                />
+              </div>
+            </div>
+          </div>
+
+          <div class="asst-quick">
+            <span v-for="q in ASST_QUICK" :key="q" class="quick-chip" @click="askAssistant(q)">{{ q }}</span>
+          </div>
+
+          <div class="asst-input">
+            <el-input v-model="asstInput" placeholder="问我：有新订单吗 / 自动处理订单 / 有售后吗"
+                      :disabled="asstLoading" @keyup.enter="askAssistant()">
+              <template #append>
+                <el-button type="primary" :loading="asstLoading" @click="askAssistant()">发送</el-button>
+              </template>
+            </el-input>
+          </div>
+        </div>
       </el-tab-pane>
     </el-tabs>
 
@@ -238,15 +318,18 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted, nextTick, onBeforeUnmount } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import ProductCard from '../components/ProductCard.vue'
+import OrderCard from '../components/OrderCard.vue'
 import {
   getUser, isMerchant,
   merchantListProducts, merchantCreateProduct, merchantUpdateProduct,
   merchantDeleteProduct, merchantSetOnSale, merchantUploadImage,
   merchantRemoveImage, merchantDashboard,
+  merchantListOrders, merchantPendingCount, merchantAcceptOrder, merchantRejectOrder,
+  merchantListAftersale, merchantHandleAftersale, merchantAssistant,
 } from '../api'
 
 const router = useRouter()
@@ -426,6 +509,161 @@ async function saveMarketing() {
   }
 }
 
+// ---- 订单接收 ----
+const orders = ref([])
+const orderFilter = ref('pending')
+const orderBusy = ref('')
+const pendingCount = ref(0)
+const aftersaleCount = ref(0)
+let countTimer = null
+
+function goOrders() {
+  tab.value = 'orders'
+  loadOrders()
+}
+
+async function refreshCounts() {
+  try {
+    const [p, a] = await Promise.all([merchantPendingCount(), merchantListAftersale()])
+    pendingCount.value = p?.data?.data?.pending_count ?? 0
+    aftersaleCount.value = a?.data?.data?.count ?? 0
+  } catch (e) { /* 轮询失败静默 */ }
+}
+
+async function loadOrders() {
+  try {
+    if (orderFilter.value === 'aftersale') {
+      const { data } = await merchantListAftersale()
+      orders.value = data?.data?.orders || []
+    } else {
+      const { data } = await merchantListOrders(orderFilter.value)
+      if (data?.code !== 0) return ElMessage.error(data?.message)
+      orders.value = data.data.orders
+      pendingCount.value = data.data.pending_count
+    }
+    // 待接单的补上选仓信息，卡片才能直接选仓
+    if (orderFilter.value === 'pending') await attachWarehouses()
+  } catch (e) {
+    orders.value = []
+  }
+  refreshCounts()
+}
+
+async function attachWarehouses() {
+  await Promise.all(orders.value.filter((o) => o.status === 'pending').map(async (o) => {
+    try {
+      const { data } = await merchantOrderWarehouses(o.order_no)
+      if (data?.code === 0) {
+        o.warehouses = data.data.warehouses
+        o.recommended_id = data.data.recommended_id
+        const best = o.warehouses.find((w) => w.id === o.recommended_id)
+        o.recommendation = best ? `建议由「${best.name}」发货：${best.reason}` : '所有仓都缺货，需要补货后再接单'
+      }
+    } catch (e) { /* 单个失败不影响其它 */ }
+  }))
+}
+
+async function acceptOrder(o, warehouseId) {
+  orderBusy.value = o.order_no
+  try {
+    const { data } = await merchantAcceptOrder(o.order_no, warehouseId)
+    if (data?.code !== 0) return ElMessage.error(data?.message)
+    ElMessage.success(data.message)
+    syncOrder(data.data)
+    loadOrders()
+  } finally {
+    orderBusy.value = ''
+  }
+}
+
+async function rejectOrder(o) {
+  try {
+    await ElMessageBox.confirm(`确定拒绝订单 ${o.order_no}？买家会看到「商家已拒单」。`, '拒单', { type: 'warning' })
+  } catch (e) { return }
+  orderBusy.value = o.order_no
+  try {
+    const { data } = await merchantRejectOrder(o.order_no)
+    if (data?.code !== 0) return ElMessage.error(data?.message)
+    ElMessage.success(data.message)
+    syncOrder(data.data)
+    loadOrders()
+  } finally {
+    orderBusy.value = ''
+  }
+}
+
+async function decideAftersale(o, approve) {
+  let reply = ''
+  try {
+    const r = await ElMessageBox.prompt(
+      approve ? '给买家一句说明（如：已同意退货，请寄回）' : '说明拒绝原因',
+      approve ? '同意售后' : '拒绝售后',
+      { inputValue: approve ? '已同意，请按提示操作' : '' },
+    )
+    reply = r.value || ''
+  } catch (e) { return }
+  orderBusy.value = o.order_no
+  try {
+    const { data } = await merchantHandleAftersale(o.order_no, approve, reply)
+    if (data?.code !== 0) return ElMessage.error(data?.message)
+    ElMessage.success(data.message)
+    syncOrder(data.data)
+    loadOrders()
+  } finally {
+    orderBusy.value = ''
+  }
+}
+
+/** 订单状态变了，把助手对话里的同号卡片一起刷新 */
+function syncOrder(updated) {
+  for (const m of asstMessages.value) {
+    const hit = (m.cards || []).find((x) => x.order_no === updated.order_no)
+    if (hit) Object.assign(hit, updated)
+  }
+}
+
+// ---- AI 订单助手 ----
+const ASST_QUICK = ['有新订单吗', '自动处理订单', '有售后要处理吗', '全部订单']
+const asstInput = ref('')
+const asstLoading = ref(false)
+const asstBodyRef = ref(null)
+const asstMessages = ref([
+  { role: 'assistant', content: '我是订单助手。可以让我列出新订单并按库存和距离推荐发货仓，也可以让我自动处理。', cards: [] },
+])
+
+async function askAssistant(preset) {
+  const text = (preset ?? asstInput.value).trim()
+  if (!text || asstLoading.value) return
+  asstInput.value = ''
+  asstMessages.value.push({ role: 'user', content: text, cards: [] })
+  asstLoading.value = true
+  scrollAsst()
+  try {
+    const { data } = await merchantAssistant(text)
+    if (data?.code !== 0) {
+      asstMessages.value.push({ role: 'assistant', content: data?.message || '出错了', cards: [] })
+    } else {
+      asstMessages.value.push({
+        role: 'assistant',
+        content: data.data.reply,
+        cards: data.data.order_cards || [],
+      })
+    }
+  } catch (e) {
+    asstMessages.value.push({ role: 'assistant', content: '（请求失败，请检查后端服务）', cards: [] })
+  } finally {
+    asstLoading.value = false
+    scrollAsst()
+    refreshCounts()
+  }
+}
+
+function scrollAsst() {
+  nextTick(() => {
+    if (asstBodyRef.value) asstBodyRef.value.scrollTop = asstBodyRef.value.scrollHeight
+  })
+}
+
 onMounted(() => {
   if (!isMerchant()) {
     ElMessage.warning('请先用商家账号登录')
@@ -433,15 +671,71 @@ onMounted(() => {
   }
   loadDashboard()
   load()
+  refreshCounts()
+  // 轮询新订单，商家不用手动刷新也能看到角标变化
+  countTimer = setInterval(refreshCounts, 20000)
+})
+
+onBeforeUnmount(() => {
+  if (countTimer) clearInterval(countTimer)
 })
 </script>
 
 <style scoped>
 .merchant-page { max-width: 1280px; margin: 0 auto; padding: 24px 20px 40px; }
 .head { display: flex; align-items: center; justify-content: space-between; }
-.head h2 { margin: 0 0 4px; color: #2a3050; }
-.sub { color: #98a0c0; margin: 0; font-size: 13px; }
+.head h2 { margin: 0 0 4px; color: var(--text); }
+.head-ops { display: flex; align-items: center; gap: 16px; }
+.sub { color: var(--text-muted); margin: 0; font-size: 13px; }
 .tabs { margin-top: 14px; }
+
+/* 订单接收入口 */
+.bell {
+  position: relative; display: flex; align-items: center; gap: 6px;
+  padding: 7px 14px; border-radius: 999px; cursor: pointer;
+  border: 1px solid var(--border); color: var(--text-sub);
+  transition: all 0.16s ease;
+}
+.bell:hover { border-color: var(--primary); color: var(--primary); }
+.bell-text { font-size: 13.5px; }
+.bell-badge {
+  position: absolute; top: -6px; right: -6px;
+  background: #ff4d4f; color: #fff; font-size: 11px; font-weight: 700;
+  min-width: 18px; height: 18px; line-height: 18px; text-align: center;
+  border-radius: 9px; padding: 0 5px; border: 2px solid var(--surface);
+}
+.tab-badge { margin-left: 6px; }
+
+/* 订单列表 */
+.order-grid { display: flex; flex-wrap: wrap; gap: 14px; }
+
+/* AI 订单助手 */
+.assistant { display: flex; flex-direction: column; height: 560px; }
+.asst-body {
+  flex: 1; overflow-y: auto; padding: 12px;
+  background: var(--bg); border-radius: 12px; border: 1px solid var(--border);
+}
+.asst-row { margin: 10px 0; }
+.asst-row.user { text-align: right; }
+.asst-bubble {
+  display: inline-block; max-width: 76%; text-align: left;
+  padding: 10px 14px; border-radius: 12px; font-size: 14px; line-height: 1.55;
+  white-space: pre-wrap;
+}
+.asst-row.user .asst-bubble { background: var(--primary-grad); color: #fff; border-bottom-right-radius: 4px; }
+.asst-row.assistant .asst-bubble {
+  background: var(--surface); color: var(--text);
+  border: 1px solid var(--border); border-bottom-left-radius: 4px;
+}
+.order-cards { display: flex; gap: 12px; margin-top: 10px; overflow-x: auto; padding-bottom: 6px; }
+.asst-quick { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
+.quick-chip {
+  padding: 5px 12px; border-radius: 999px; cursor: pointer; font-size: 12.5px;
+  background: var(--surface); border: 1px solid var(--border); color: var(--text-sub);
+  transition: all 0.15s ease;
+}
+.quick-chip:hover { border-color: var(--primary); color: var(--primary); }
+:deep(.asst-input .el-input__wrapper) { border-radius: 10px; }
 
 /* 看板 */
 .board-head { margin-bottom: 14px; }

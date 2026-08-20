@@ -5,7 +5,7 @@
 from fastapi import APIRouter, File, Header, UploadFile
 from pydantic import BaseModel
 
-from app.services import auth, merchant
+from app.services import auth, merchant, merchant_assistant, order as order_svc
 
 router = APIRouter(prefix="/api/merchant", tags=["merchant"])
 
@@ -151,3 +151,105 @@ def remove_image(product_id: int, authorization: str | None = Header(None)):
     except (auth.AuthError, merchant.MerchantError) as e:
         return _err(e)
     return {"code": 0, "message": "已清除主图", "data": None}
+
+
+# ============ 订单接收 ============
+
+@router.get("/orders")
+def list_orders(status: str = "", authorization: str | None = Header(None)):
+    try:
+        mid = _merchant_id(authorization)
+        orders = order_svc.merchant_orders(mid, status)
+        pending = order_svc.pending_count(mid)
+    except (auth.AuthError, order_svc.OrderError) as e:
+        return _err(e)
+    return {"code": 0, "message": "ok", "data": {"orders": orders, "pending_count": pending}}
+
+
+@router.get("/orders/pending-count")
+def pending_count(authorization: str | None = Header(None)):
+    """给商家端右上角的新订单角标轮询用。"""
+    try:
+        mid = _merchant_id(authorization)
+        n = order_svc.pending_count(mid)
+    except (auth.AuthError, order_svc.OrderError) as e:
+        return _err(e)
+    return {"code": 0, "message": "ok", "data": {"pending_count": n}}
+
+
+@router.get("/orders/{order_no}/warehouses")
+def order_warehouses(order_no: str, authorization: str | None = Header(None)):
+    """接单前的选仓面板：各仓到收货地址的距离 + 该单商品在各仓的剩余量。"""
+    try:
+        mid = _merchant_id(authorization)
+        data = order_svc.warehouse_options(mid, order_no)
+    except (auth.AuthError, order_svc.OrderError) as e:
+        return _err(e)
+    return {"code": 0, "message": "ok", "data": data}
+
+
+class AcceptPayload(BaseModel):
+    warehouse_id: int | None = None
+
+
+@router.post("/orders/{order_no}/accept")
+def accept_order(order_no: str, req: AcceptPayload | None = None, authorization: str | None = Header(None)):
+    try:
+        mid = _merchant_id(authorization)
+        data = order_svc.accept_order(mid, order_no, (req or AcceptPayload()).warehouse_id)
+    except (auth.AuthError, order_svc.OrderError) as e:
+        return _err(e)
+    return {"code": 0, "message": f"已接单，由「{data['origin_name'] or '默认仓'}」发货", "data": data}
+
+
+@router.post("/orders/{order_no}/reject")
+def reject_order(order_no: str, authorization: str | None = Header(None)):
+    try:
+        mid = _merchant_id(authorization)
+        data = order_svc.reject_order(mid, order_no)
+    except (auth.AuthError, order_svc.OrderError) as e:
+        return _err(e)
+    return {"code": 0, "message": "已拒单", "data": data}
+
+
+# ============ 售后 ============
+
+@router.get("/aftersale")
+def list_aftersale(authorization: str | None = Header(None)):
+    try:
+        mid = _merchant_id(authorization)
+        orders = order_svc.aftersale_orders(mid)
+    except (auth.AuthError, order_svc.OrderError) as e:
+        return _err(e)
+    return {"code": 0, "message": "ok", "data": {"orders": orders, "count": len(orders)}}
+
+
+class AftersaleDecision(BaseModel):
+    approve: bool
+    reply: str = ""
+
+
+@router.post("/orders/{order_no}/aftersale")
+def handle_aftersale(order_no: str, req: AftersaleDecision, authorization: str | None = Header(None)):
+    try:
+        mid = _merchant_id(authorization)
+        data = order_svc.handle_aftersale(mid, order_no, req.approve, req.reply)
+    except (auth.AuthError, order_svc.OrderError) as e:
+        return _err(e)
+    return {"code": 0, "message": "售后已通过" if req.approve else "售后已拒绝", "data": data}
+
+
+# ============ 订单助手（商家端 AI 对话） ============
+
+class AssistantRequest(BaseModel):
+    message: str
+
+
+@router.post("/assistant")
+def assistant(req: AssistantRequest, authorization: str | None = Header(None)):
+    try:
+        mid = _merchant_id(authorization)
+        data = merchant_assistant.handle(mid, req.message)
+    except (auth.AuthError, order_svc.OrderError) as e:
+        return _err(e)
+    return {"code": 0, "message": "ok", "data": data}

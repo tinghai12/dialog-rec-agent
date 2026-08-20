@@ -33,12 +33,43 @@ COLUMNS = {
     "users": [
         ("role", "VARCHAR(20) NOT NULL DEFAULT 'buyer' COMMENT '角色: buyer/merchant'"),
         ("shop_name", "VARCHAR(100) NOT NULL DEFAULT '' COMMENT '店铺名'"),
+        ("warehouse_name", "VARCHAR(100) NOT NULL DEFAULT '' COMMENT '仓库名(发货点)'"),
+        ("warehouse_address", "VARCHAR(255) NOT NULL DEFAULT '' COMMENT '仓库地址'"),
+        ("warehouse_lng", "DECIMAL(10,6) NULL COMMENT '仓库经度'"),
+        ("warehouse_lat", "DECIMAL(10,6) NULL COMMENT '仓库纬度'"),
     ],
     "messages": [
         ("cards", "JSON NULL COMMENT '该条回复附带的推荐卡片'"),
     ],
     "sessions": [
         ("pinned", "TINYINT NOT NULL DEFAULT 0 COMMENT '是否置顶 0/1'"),
+    ],
+    "orders": [
+        ("merchant_id", "BIGINT NULL COMMENT '所属商家(按商家拆单)'"),
+        ("shop_name", "VARCHAR(100) NOT NULL DEFAULT '' COMMENT '店铺名快照'"),
+        ("address_id", "BIGINT NULL COMMENT '收货地址ID'"),
+        ("receiver", "VARCHAR(50) NOT NULL DEFAULT '' COMMENT '收货人'"),
+        ("phone", "VARCHAR(20) NOT NULL DEFAULT '' COMMENT '联系电话'"),
+        ("address_text", "VARCHAR(255) NOT NULL DEFAULT '' COMMENT '完整收货地址'"),
+        ("dest_lng", "DECIMAL(10,6) NULL COMMENT '收货点经度'"),
+        ("dest_lat", "DECIMAL(10,6) NULL COMMENT '收货点纬度'"),
+        ("origin_lng", "DECIMAL(10,6) NULL COMMENT '发货点经度'"),
+        ("origin_lat", "DECIMAL(10,6) NULL COMMENT '发货点纬度'"),
+        ("origin_name", "VARCHAR(100) NOT NULL DEFAULT '' COMMENT '发货点名称'"),
+        ("warehouse_id", "BIGINT NULL COMMENT '接单时选择的发货仓'"),
+        ("route", "JSON NULL COMMENT '路径规划得到的道路点'"),
+        ("eta_minutes", "INT NOT NULL DEFAULT 30 COMMENT '预计配送总时长(分钟)'"),
+        ("rider_name", "VARCHAR(50) NOT NULL DEFAULT '' COMMENT '骑手姓名'"),
+        ("rider_phone", "VARCHAR(20) NOT NULL DEFAULT '' COMMENT '骑手电话'"),
+        ("confirmed_at", "DATETIME NULL COMMENT '商家接单时间'"),
+        ("shipped_at", "DATETIME NULL COMMENT '发货时间'"),
+        ("delivered_at", "DATETIME NULL COMMENT '送达时间'"),
+        ("aftersale_status", "VARCHAR(20) NOT NULL DEFAULT 'none' "
+                             "COMMENT 'none/pending待处理/approved已同意/rejected已拒绝'"),
+        ("aftersale_type", "VARCHAR(20) NOT NULL DEFAULT '' COMMENT 'refund退款/return退货/exchange换货/repair维修'"),
+        ("aftersale_reason", "VARCHAR(255) NOT NULL DEFAULT '' COMMENT '售后原因'"),
+        ("aftersale_reply", "VARCHAR(255) NOT NULL DEFAULT '' COMMENT '商家处理说明'"),
+        ("aftersale_at", "DATETIME NULL COMMENT '申请时间'"),
     ],
     "products": [
         ("merchant_id", "BIGINT NULL COMMENT '所属商家 users.id'"),
@@ -67,6 +98,7 @@ COLUMNS = {
 INDEXES = [
     ("users", "idx_role", "ALTER TABLE users ADD KEY idx_role (role)"),
     ("products", "idx_merchant", "ALTER TABLE products ADD KEY idx_merchant (merchant_id)"),
+    ("orders", "idx_merchant_status", "ALTER TABLE orders ADD KEY idx_merchant_status (merchant_id, status)"),
 ]
 
 EVENTS_DDL = """
@@ -82,6 +114,51 @@ CREATE TABLE IF NOT EXISTS product_events (
     KEY idx_product_type (product_id, event_type),
     KEY idx_created (created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='商品埋点事件'
+"""
+
+ADDRESSES_DDL = """
+CREATE TABLE IF NOT EXISTS addresses (
+    id            BIGINT AUTO_INCREMENT PRIMARY KEY,
+    user_id       BIGINT        NOT NULL,
+    receiver      VARCHAR(50)   NOT NULL,
+    phone         VARCHAR(20)   NOT NULL,
+    province      VARCHAR(50)   NOT NULL DEFAULT '',
+    city          VARCHAR(50)   NOT NULL DEFAULT '',
+    district      VARCHAR(50)   NOT NULL DEFAULT '',
+    detail        VARCHAR(255)  NOT NULL,
+    lng           DECIMAL(10,6) NULL,
+    lat           DECIMAL(10,6) NULL,
+    is_default    TINYINT       NOT NULL DEFAULT 0,
+    created_at    DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at    DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    KEY idx_user (user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='收货地址'
+"""
+
+WAREHOUSES_DDL = """
+CREATE TABLE IF NOT EXISTS warehouses (
+    id            BIGINT AUTO_INCREMENT PRIMARY KEY,
+    merchant_id   BIGINT        NOT NULL,
+    name          VARCHAR(100)  NOT NULL,
+    address       VARCHAR(255)  NOT NULL DEFAULT '',
+    lng           DECIMAL(10,6) NULL,
+    lat           DECIMAL(10,6) NULL,
+    is_default    TINYINT       NOT NULL DEFAULT 0,
+    created_at    DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    KEY idx_merchant (merchant_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='商家仓库'
+"""
+
+WAREHOUSE_STOCK_DDL = """
+CREATE TABLE IF NOT EXISTS warehouse_stock (
+    id            BIGINT AUTO_INCREMENT PRIMARY KEY,
+    warehouse_id  BIGINT        NOT NULL,
+    product_id    BIGINT        NOT NULL,
+    quantity      INT           NOT NULL DEFAULT 0,
+    updated_at    DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uk_wh_product (warehouse_id, product_id),
+    KEY idx_product (product_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='分仓库存'
 """
 
 # ---- 营销位素材池（按 id 轮换，保证确定性） ----
@@ -122,6 +199,28 @@ RANK_LABELS = {
 }
 PROMO_START = "2026-08-04 00:00:00"
 PROMO_END = "2026-08-31 23:59:59"
+
+# 商家仓库（发货点）。按品牌顺序稳定分配，坐标为各城市电商仓储聚集区的大致位置
+WAREHOUSES = [
+    ("深圳民治电商仓", "广东省深圳市龙华区民治街道电商产业园", 114.044600, 22.648600),
+    ("广州石井物流仓", "广东省广州市白云区石井街道物流基地", 113.253600, 23.198800),
+    ("杭州仓前智慧仓", "浙江省杭州市余杭区仓前街道智慧物流园", 120.007200, 30.285600),
+    ("上海华新中心仓", "上海市青浦区华新镇电商仓储中心", 121.155300, 31.185600),
+    ("北京亦庄前置仓", "北京市大兴区亦庄经济开发区科创五街", 116.506300, 39.795500),
+    ("苏州黄埭云仓", "江苏省苏州市相城区黄埭镇云仓基地", 120.534100, 31.419200),
+    ("成都大面分拨仓", "四川省成都市龙泉驿区大面街道分拨中心", 104.240400, 30.583400),
+    ("武汉吴家山仓", "湖北省武汉市东西湖区吴家山物流园", 114.137200, 30.625500),
+    ("郑州中牟电商仓", "河南省郑州市中牟县电子商务产业园", 113.976400, 34.718900),
+    ("西安韦曲仓储", "陕西省西安市长安区韦曲街道仓储中心", 108.913700, 34.156800),
+    ("重庆空港仓", "重庆市渝北区空港工业园区", 106.630100, 29.718500),
+    ("南京禄口仓", "江苏省南京市江宁区禄口街道物流园", 118.782200, 31.741100),
+    ("天津武清仓", "天津市武清区京津电商城", 117.044700, 39.384100),
+    ("长沙金山桥仓", "湖南省长沙市望城区金山桥物流园", 112.819500, 28.340600),
+    ("合肥桃花工业仓", "安徽省合肥市肥西县桃花工业园", 117.158500, 31.726400),
+    ("东莞常平仓", "广东省东莞市常平镇电商仓储区", 114.028500, 22.970900),
+    ("佛山狮山仓", "广东省佛山市南海区狮山镇物流中心", 113.015800, 23.143900),
+    ("宁波骆驼仓", "浙江省宁波市镇海区骆驼街道仓储园", 121.564200, 29.940300),
+]
 
 
 def _conn():
@@ -170,7 +269,10 @@ def step1_alter(cur) -> None:
             cur.execute(sql)
             print(f"  + index {table}.{index}")
     cur.execute(EVENTS_DDL)
-    print(f"  字段补齐完成（新增 {added} 列），product_events 就绪")
+    cur.execute(ADDRESSES_DDL)
+    cur.execute(WAREHOUSES_DDL)
+    cur.execute(WAREHOUSE_STOCK_DDL)
+    print(f"  字段补齐完成（新增 {added} 列），product_events / addresses / warehouses 就绪")
 
 
 def step2_import_products(cur) -> list[dict]:
@@ -204,20 +306,28 @@ def step3_merchants(cur, products: list[dict]) -> dict[str, int]:
     for i, brand in enumerate(brands, start=1):
         username = f"merchant{i:02d}"
         shop_name = f"{brand}官方旗舰店"
-        cur.execute("SELECT id FROM users WHERE username=%s", (username,))
+        wh = WAREHOUSES[(i - 1) % len(WAREHOUSES)]
+        cur.execute("SELECT id, warehouse_lng FROM users WHERE username=%s", (username,))
         row = cur.fetchone()
         if row:
-            # 已存在则只补角色/店铺名，不覆盖密码
+            # 已存在则只补角色/店铺名；仓库地址仅在从未设置时填充，避免覆盖商家自己改的
             cur.execute(
                 "UPDATE users SET role='merchant', shop_name=%s, nickname=%s WHERE id=%s",
                 (shop_name, shop_name, row["id"]),
             )
+            if row["warehouse_lng"] is None:
+                cur.execute(
+                    "UPDATE users SET warehouse_name=%s, warehouse_address=%s, "
+                    "warehouse_lng=%s, warehouse_lat=%s WHERE id=%s",
+                    (wh[0], wh[1], wh[2], wh[3], row["id"]),
+                )
             brand_to_id[brand] = row["id"]
             continue
         cur.execute(
-            "INSERT INTO users (username, password_hash, nickname, role, shop_name) "
-            "VALUES (%s, %s, %s, 'merchant', %s)",
-            (username, pw_hash, shop_name, shop_name),
+            "INSERT INTO users (username, password_hash, nickname, role, shop_name, "
+            "warehouse_name, warehouse_address, warehouse_lng, warehouse_lat) "
+            "VALUES (%s, %s, %s, 'merchant', %s, %s, %s, %s, %s)",
+            (username, pw_hash, shop_name, shop_name, wh[0], wh[1], wh[2], wh[3]),
         )
         cur.execute("SELECT id FROM users WHERE username=%s", (username,))
         brand_to_id[brand] = cur.fetchone()["id"]
@@ -294,25 +404,79 @@ def step4_marketing(cur, products: list[dict], only_empty: bool = True) -> None:
     print(f"  营销位填充 {len(todo)} 款商品")
 
 
+def step5_warehouses(cur, brand_to_id: dict[str, int], products: list[dict], force: bool = False) -> None:
+    """给每个商家生成 2~3 个仓库，并为其商品分配各仓库存。
+
+    库存用 (商品id, 仓库序号) 的确定性哈希生成，其中约 1/6 会是 0，
+    这样商家接单选仓时能真实碰到"某仓缺货、换个仓发"的场景。
+    """
+    cur.execute("SELECT COUNT(*) AS n FROM warehouses")
+    if cur.fetchone()["n"] and not force:
+        print("  仓库已存在，跳过（加 --force 可重建）")
+        return
+    if force:
+        cur.execute("DELETE FROM warehouse_stock")
+        cur.execute("DELETE FROM warehouses")
+
+    by_merchant: dict[int, list[dict]] = {}
+    for p in products:
+        mid = brand_to_id.get(p["brand"])
+        if mid:
+            by_merchant.setdefault(mid, []).append(p)
+
+    total_wh = total_stock = 0
+    for idx, (brand, mid) in enumerate(sorted(brand_to_id.items(), key=lambda kv: kv[1])):
+        n_wh = 2 + (mid % 2)                       # 2~3 个仓
+        wh_ids = []
+        for j in range(n_wh):
+            wh = WAREHOUSES[(idx + j * 5) % len(WAREHOUSES)]
+            cur.execute(
+                "INSERT INTO warehouses (merchant_id, name, address, lng, lat, is_default) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                (mid, f"{brand}·{wh[0]}", wh[1], wh[2], wh[3], 1 if j == 0 else 0),
+            )
+            wh_ids.append(cur.lastrowid)
+            total_wh += 1
+
+        rows = []
+        for p in by_merchant.get(mid, []):
+            for j, wid in enumerate(wh_ids):
+                h = (int(p["id"]) * 31 + j * 977) % 120
+                qty = 0 if h < 20 else h - 15      # 约 1/6 缺货，其余 5~104 件
+                rows.append((wid, p["id"], qty))
+        if rows:
+            cur.executemany(
+                "INSERT INTO warehouse_stock (warehouse_id, product_id, quantity) VALUES (%s, %s, %s) "
+                "ON DUPLICATE KEY UPDATE quantity=VALUES(quantity)",
+                rows,
+            )
+            total_stock += len(rows)
+    print(f"  生成 {total_wh} 个仓库，{total_stock} 条分仓库存")
+
+
 def main() -> None:
     force = "--force" in sys.argv
     conn = _conn()
     try:
         with conn.cursor() as cur:
-            print("[1/4] 补齐表结构")
+            print("[1/5] 补齐表结构")
             step1_alter(cur)
             conn.commit()
 
-            print("[2/4] 导入商品")
+            print("[2/5] 导入商品")
             products = step2_import_products(cur)
             conn.commit()
 
-            print("[3/4] 创建商家并绑定商品")
-            step3_merchants(cur, products)
+            print("[3/5] 创建商家并绑定商品")
+            brand_to_id = step3_merchants(cur, products)
             conn.commit()
 
-            print(f"[4/4] 填充营销位{'（强制重置）' if force else ''}")
+            print(f"[4/5] 填充营销位{'（强制重置）' if force else ''}")
             step4_marketing(cur, products, only_empty=not force)
+            conn.commit()
+
+            print("[5/5] 生成仓库与分仓库存")
+            step5_warehouses(cur, brand_to_id, products, force=force)
             conn.commit()
     finally:
         conn.close()

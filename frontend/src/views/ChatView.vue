@@ -111,6 +111,18 @@
                 </div>
               </div>
             </div>
+
+            <!-- 订单卡片：横向滚动 -->
+            <div v-if="m.orderCards && m.orderCards.length" class="order-cards">
+              <OrderCard
+                v-for="o in m.orderCards"
+                :key="o.order_no"
+                :order="o"
+                role="buyer"
+                @track="goTrack"
+                @aftersale="askAftersale"
+              />
+            </div>
           </div>
         </div>
 
@@ -136,18 +148,19 @@ import { ref, computed, onMounted, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import ProductThumb from '../components/ProductThumb.vue'
+import OrderCard from '../components/OrderCard.vue'
 import { theme, toggleTheme } from '../theme'
 import {
   sendChat, addToCart as apiAddToCart, addFavorite, getSessionId, setSessionId,
   getSessions, getSessionMessages, isLoggedIn, getUser,
-  renameSession, pinSession, deleteSession,
+  renameSession, pinSession, deleteSession, applyAftersale,
 } from '../api'
 
 const EXAMPLES = [
   '想买个写代码的笔记本，七千左右',
   '三千左右拍照好的手机',
-  '轻薄本，1.3kg 以内，续航久一点',
-  '预算五千，玩游戏的手机',
+  '我的订单到哪了',
+  '我要申请售后',
 ]
 
 const router = useRouter()
@@ -298,6 +311,40 @@ function scrollBottom() {
   })
 }
 
+// ---- 订单卡片交互 ----
+function goTrack(o) {
+  router.push(`/orders/${o.order_no}/track`)
+}
+
+async function askAftersale(o) {
+  let kind
+  try {
+    const r = await ElMessageBox.prompt('说明一下售后原因，方便商家处理', '申请售后', {
+      inputPlaceholder: '例如：屏幕有划痕，想退货',
+      inputValidator: (v) => (v && v.trim() ? true : '请填写原因'),
+      distinguishCancelAndClose: true,
+    })
+    kind = r.value
+  } catch (e) {
+    return
+  }
+  const { data } = await applyAftersale(o.order_no, guessKind(kind), kind.trim())
+  if (data?.code !== 0) return ElMessage.error(data?.message)
+  ElMessage.success(data.message)
+  // 就地更新卡片状态，不用重新发消息
+  for (const m of messages.value) {
+    const hit = (m.orderCards || []).find((x) => x.order_no === o.order_no)
+    if (hit) Object.assign(hit, data.data)
+  }
+}
+
+function guessKind(text) {
+  if (text.includes('退货')) return 'return'
+  if (text.includes('换')) return 'exchange'
+  if (text.includes('修')) return 'repair'
+  return 'refund'
+}
+
 async function send() {
   const text = input.value.trim()
   if (!text || loading.value) return
@@ -313,6 +360,7 @@ async function send() {
       role: 'assistant',
       content: body.reply || '',
       cards: body.cards || [],
+      orderCards: body.order_cards || [],
     })
   } catch (e) {
     messages.value.push({ role: 'assistant', content: '（请求失败，请检查后端服务）', cards: [] })
@@ -427,6 +475,13 @@ onMounted(() => {
   box-shadow: var(--card-shadow);
 }
 .cards { display: flex; flex-direction: column; gap: 12px; margin-top: 10px; max-width: 720px; }
+
+/* 订单卡片：横向排列，超出可横向滚动 */
+.order-cards {
+  display: flex; gap: 12px; margin-top: 10px;
+  overflow-x: auto; padding-bottom: 6px; max-width: 100%;
+}
+.order-cards::-webkit-scrollbar { height: 6px; }
 /* 左图右文 */
 .product-card {
   display: flex; gap: 14px; padding: 14px; cursor: pointer;

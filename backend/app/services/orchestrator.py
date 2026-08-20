@@ -8,7 +8,7 @@ import copy
 import re
 
 from app.core.config import settings
-from app.services import cart, catalog, favorites, llm, text2sql, vector_store
+from app.services import cart, catalog, favorites, llm, order as order_svc, text2sql, vector_store
 from app.services.session_store import get_or_create, save as session_save
 
 _CN_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5}
@@ -503,6 +503,15 @@ def handle_message(session_id: str | None, message: str, user_id: int | None = N
     session.history.append({"role": "user", "content": message})
     session.turn_no += 1
 
+    # 订单/售后类问题先走规则：这些意图不在推荐域的 LLM 意图表里
+    order_intent = _order_intent(message)
+    if order_intent:
+        result = _handle_order_question(session, order_intent, message)
+        result["session_id"] = session.session_id
+        _attach_cards_to_history(session, result)
+        session_save(session)
+        return result
+
     # 优先用 LLM 理解意图
     intent = None
     try:
@@ -554,6 +563,106 @@ def _attach_cards_to_history(session, result: dict) -> None:
         return
     if cards:
         last["cards"] = cards
+
+
+# ============ 订单 / 售后（买家侧订单助手） ============
+
+_ORDER_RULES = [
+    ("aftersale", ["申请售后", "售后", "退货", "退款", "换货", "报修", "维修"]),
+    ("track", ["到哪了", "到哪儿了", "快递", "物流", "配送到", "送到哪", "什么时候到", "还要多久", "运输状态", "配送状态"]),
+    ("my_orders", ["我的订单", "订单状态", "查订单", "查看订单", "订单情况", "买了什么"]),
+]
+
+_AFTERSALE_KINDS = [
+    ("return", ["退货"]),
+    ("exchange", ["换货", "换一个", "换新"]),
+    ("repair", ["维修", "报修", "修一下"]),
+    ("refund", ["退款", "退钱", "仅退款"]),
+]
+
+
+def _order_intent(message: str) -> str | None:
+    for intent, keys in _ORDER_RULES:
+        if any(k in message for k in keys):
+            return intent
+    return None
+
+
+def _aftersale_kind(message: str) -> str:
+    for kind, keys in _AFTERSALE_KINDS:
+        if any(k in message for k in keys):
+            return kind
+    return "refund"
+
+
+def _pick_order(orders: list[dict], message: str) -> dict | None:
+    """从消息里定位订单：优先订单号，其次「第N个」，再次最近一笔。"""
+    m = re.search(r"\bD\d{14}[A-Z0-9]{6}\b", message.upper())
+    if m:
+        return next((o for o in orders if o["order_no"] == m.group(0)), None)
+    m2 = re.search(r"第\s*([一二三四五1-5])\s*[个笔单]", message)
+    if m2:
+        idx = _CN_NUM.get(m2.group(1), int(m2.group(1)) if m2.group(1).isdigit() else 1)
+        if 1 <= idx <= len(orders):
+            return orders[idx - 1]
+    return orders[0] if orders else None
+
+
+def _handle_order_question(session, intent: str, message: str) -> dict:
+    if not session.user_id:
+        return {"reply": "查订单要先登录，去右上角登录一下就能看了。",
+                "cards": [], "needs_more": False, "action": "need_login"}
+
+    orders = order_svc.list_orders(session.user_id)
+    if not orders:
+        return {"reply": "你还没有订单，去逛逛下单吧。", "cards": [], "needs_more": False}
+
+    if intent == "aftersale":
+        target = _pick_order(orders, message)
+        kind = _aftersale_kind(message)
+        # 明确指向某一单才直接提交，否则先让用户确认是哪一单
+        explicit = bool(re.search(r"\bD\d{14}[A-Z0-9]{6}\b", message.upper())
+                        or re.search(r"第\s*[一二三四五1-5]\s*[个笔单]", message))
+        if not explicit and len(orders) > 1:
+            return {
+                "reply": f"你有 {len(orders)} 笔订单，要给哪一笔申请售后？在卡片上点「申请售后」，或者告诉我第几笔。",
+                "cards": [], "order_cards": orders[:8], "needs_more": False, "action": "pick_aftersale",
+            }
+        try:
+            updated = order_svc.apply_aftersale(session.user_id, target["order_no"], kind, message[:120])
+        except order_svc.OrderError as e:
+            return {"reply": str(e), "cards": [], "order_cards": [target], "needs_more": False}
+        return {
+            "reply": (f"已为订单 {updated['order_no']} 提交{updated['aftersale_type_text']}申请，"
+                      f"已通知「{updated['shop_name']}」，商家处理后我会在这里告诉你。"),
+            "cards": [], "order_cards": [updated], "needs_more": False, "action": "aftersale_applied",
+        }
+
+    if intent == "track":
+        shipping = [o for o in orders if o["status"] == "shipping"]
+        target = _pick_order(shipping or orders, message)
+        if target["status"] == "shipping":
+            text = (f"{target['rider_name']}正在从「{target['origin_name'] or '发货仓'}」送往 "
+                    f"{target['address_text']}，已走了 {round(target['progress'] * 100)}%，"
+                    f"预计还有 {target['remain_minutes']} 分钟送达。点卡片看实时轨迹。")
+        elif target["status"] == "pending":
+            text = f"订单 {target['order_no']} 还在等「{target['shop_name']}」接单，接单后就能看配送轨迹了。"
+        elif target["status"] == "delivered":
+            text = f"订单 {target['order_no']} 已经送达了。如果有问题可以跟我说申请售后。"
+        else:
+            text = f"订单 {target['order_no']} 状态：{target['status_text']}。"
+        return {"reply": text, "cards": [], "order_cards": [target], "needs_more": False}
+
+    # my_orders
+    shipping = [o for o in orders if o["status"] == "shipping"]
+    aftersale = [o for o in orders if o["aftersale_status"] == "pending"]
+    parts = [f"你有 {len(orders)} 笔订单"]
+    if shipping:
+        parts.append(f"{len(shipping)} 笔配送中")
+    if aftersale:
+        parts.append(f"{len(aftersale)} 笔售后处理中")
+    return {"reply": "，".join(parts) + "。点卡片可以看轨迹或申请售后。",
+            "cards": [], "order_cards": orders[:8], "needs_more": False}
 
 
 def _maybe_follow_up_clarify(session, result: dict) -> dict:
@@ -623,14 +732,28 @@ def _handle_ecommerce(session, intent: dict) -> dict:
                 return {"reply": "已从购物车移除。", "cards": [], "needs_more": False, "action": "cart_changed"}
             return {"reply": "购物车里没找到这个商品。", "cards": [], "needs_more": False}
         if it == "checkout":
-            order = cart.create_order(session.user_id)
-            return {"reply": f"下单成功！订单号 {order['order_no']}，共 ¥{order['total_amount']:.0f}，状态待处理。", "cards": [], "needs_more": False, "action": "ordered"}
+            orders = order_svc.create_order(session.user_id)
+            total = sum(o["total_amount"] for o in orders)
+            if len(orders) == 1:
+                text = (f"下单成功！订单号 {orders[0]['order_no']}，共 ¥{total:.0f}，"
+                        f"已通知「{orders[0]['shop_name']}」，等商家接单后就能看配送轨迹。")
+            else:
+                text = (f"下单成功！商品来自 {len(orders)} 个店铺，已拆成 {len(orders)} 笔订单，"
+                        f"合计 ¥{total:.0f}，等商家接单后就能看配送轨迹。")
+            return {"reply": text, "cards": [], "order_cards": orders, "needs_more": False, "action": "ordered"}
         if it == "my_orders":
-            orders = cart.get_orders(session.user_id)
+            orders = order_svc.list_orders(session.user_id)
             if not orders:
                 return {"reply": "你还没有订单，去逛一逛下单吧。", "cards": [], "needs_more": False}
-            lines = [f"{o['order_no']} · ¥{o['total_amount']:.0f} · {o['status']}" for o in orders[:5]]
-            return {"reply": "你的订单：\n" + "\n".join(lines), "cards": [], "needs_more": False}
+            shipping = [o for o in orders if o["status"] == "shipping"]
+            if shipping:
+                o = shipping[0]
+                text = (f"你有 {len(orders)} 笔订单，其中 {len(shipping)} 笔正在配送。"
+                        f"{o['rider_name']}正在送「{o['products'][0]['title'][:16]}」，"
+                        f"预计还有 {o['remain_minutes']} 分钟送达，点卡片可以看实时轨迹。")
+            else:
+                text = f"你有 {len(orders)} 笔订单，最近一笔状态是「{orders[0]['status_text']}」。"
+            return {"reply": text, "cards": [], "order_cards": orders[:8], "needs_more": False}
         if it == "my_favs":
             favs = favorites.list_favorites(session.user_id)
             if not favs:
@@ -638,5 +761,7 @@ def _handle_ecommerce(session, intent: dict) -> dict:
             lines = [f"{f['title'][:24]} ¥{f['price']:.0f}" for f in favs[:8]]
             return {"reply": "你的收藏：\n" + "\n".join(lines), "cards": [], "needs_more": False}
     except cart.CartError as e:
+        return {"reply": str(e), "cards": [], "needs_more": False}
+    except order_svc.OrderError as e:
         return {"reply": str(e), "cards": [], "needs_more": False}
     return {"reply": "好的，收到。", "cards": [], "needs_more": False}

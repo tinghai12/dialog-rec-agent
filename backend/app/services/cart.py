@@ -1,11 +1,10 @@
-"""购物车 / 订单 / 用户画像服务（按用户隔离）。
+"""购物车 / 用户画像服务（按用户隔离）。
 
-- 购物车、订单、画像全部按 user_id 隔离（登录用户）
+- 购物车、画像按 user_id 隔离（登录用户）
 - 画像：聚合该用户所有历史会话的槽位，生成全局偏好标签与雷达图
+- 订单相关逻辑见 services/order.py
 """
 import json
-import uuid
-from datetime import datetime
 
 import pymysql
 
@@ -90,60 +89,6 @@ def remove_cart_item(user_id: int, item_id: int) -> list[dict]:
     finally:
         conn.close()
     return get_cart(user_id)
-
-
-# ============ 订单 ============
-
-def create_order(user_id: int) -> dict:
-    """购物车 → 订单（人在环路确认后调用）。"""
-    cart = get_cart(user_id)
-    if not cart:
-        raise CartError("购物车为空")
-    total = round(sum(c["price"] * c["quantity"] for c in cart), 2)
-    snapshot = [{"id": c["product_id"], "title": c["title"], "price": c["price"], "quantity": c["quantity"]} for c in cart]
-    order_no = "D" + datetime.now().strftime("%Y%m%d%H%M%S") + uuid.uuid4().hex[:6].upper()
-    conn = _conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO orders (order_no, user_id, products, total_amount, status) VALUES (%s, %s, %s, %s, 'pending')",
-                (order_no, user_id, json.dumps(snapshot, ensure_ascii=False), total),
-            )
-            cur.execute("DELETE FROM cart_items WHERE user_id=%s", (user_id,))
-        conn.commit()
-    finally:
-        conn.close()
-    return {"order_no": order_no, "products": snapshot, "total_amount": total, "status": "pending"}
-
-
-def get_orders(user_id: int) -> list[dict]:
-    conn = _conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT order_no, products, total_amount, status, created_at FROM orders "
-                "WHERE user_id=%s ORDER BY created_at DESC",
-                (user_id,),
-            )
-            rows = cur.fetchall()
-    finally:
-        conn.close()
-    out = []
-    for r in rows:
-        products = r["products"]
-        if isinstance(products, str):
-            try:
-                products = json.loads(products)
-            except json.JSONDecodeError:
-                products = []
-        out.append({
-            "order_no": r["order_no"],
-            "products": products,
-            "total_amount": float(r["total_amount"]),
-            "status": r["status"],
-            "created_at": r["created_at"].strftime("%Y-%m-%d %H:%M") if r["created_at"] else "",
-        })
-    return out
 
 
 # ============ 用户画像（聚合该用户所有会话） ============

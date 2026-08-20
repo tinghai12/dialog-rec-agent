@@ -9,6 +9,7 @@ const routes = [
   { path: '/favorites', name: 'favorites', component: () => import('../views/FavoritesView.vue') },
   { path: '/me', name: 'me', component: () => import('../views/MyCartView.vue') },
   { path: '/share/:key', name: 'share', component: () => import('../views/ShareView.vue') },
+  { path: '/orders/:orderNo/track', name: 'order-track', component: () => import('../views/OrderTrackView.vue') },
   {
     path: '/merchant',
     name: 'merchant',
